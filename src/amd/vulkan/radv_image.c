@@ -1257,7 +1257,7 @@ radv_image_init_first_mip_pipe_misaligned(const struct radv_device *device, stru
    }
 }
 
-/* Xclipse (opt-in): BC5_UNORM's EAC_R11G11 plane can share plane 0's memory. Both are 16-byte 4x4
+/* Xclipse (on by default): BC5_UNORM's EAC_R11G11 plane can share plane 0's memory. Both are 16-byte 4x4
  * blocks, and every write into the image then transcodes either straight from the copy's source
  * buffer (radv_CmdCopyBufferToImage2) or in place (a copy into plane 0, then radv_meta_decode_bc
  * reading and writing each block where it is). Only when the two surfaces are laid out
