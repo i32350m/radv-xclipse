@@ -20,7 +20,7 @@ jobs:
           pip install meson mako packaging pyyaml
 
       - name: Apply diagnostic patch
-        run: python3 patch_940.py
+        run: python3 patch_940b.py
 
       - name: Build
         run: ./build.sh "$ANDROID_NDK_LATEST_HOME"
