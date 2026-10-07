@@ -1,0 +1,233 @@
+import re, pathlib, sys
+
+def rd(p): return pathlib.Path(p).read_text()
+def wr(p, s): pathlib.Path(p).write_text(s)
+
+# 1) logging always on (level 2) so no environment variable / adb is needed
+p = "src/amd/common/radv_log_helper.c"
+s = rd(p)
+anchor = "ac_xclipse_log_level(void)\n{\n"
+assert anchor in s, "log level anchor not found"
+s = s.replace(anchor, anchor + "   return 2; /* DIAG BUILD: always verbose */\n", 1)
+wr(p, s)
+
+# 2) native stderr never reaches logcat on Android: send it there
+LOG = '__android_log_print(ANDROID_LOG_ERROR, "RADV_XCLIPSE", '
+for p in ["src/amd/common/ac_gpu_info.c", "src/amd/vulkan/radv_physical_device.c"]:
+    s = rd(p)
+    n = s.count("fprintf(stderr, ")
+    s = s.replace("fprintf(stderr, ", LOG)
+    if "android/log.h" not in s:
+        s = '#ifdef __ANDROID__\n#include <android/log.h>\n#endif\n' + s
+    wr(p, s)
+    print(p, "stderr->logcat:", n)
+
+# 3) extra markers in the device enumeration path
+p = "src/amd/vulkan/radv_physical_device.c"
+s = rd(p)
+def ins_after(s, anchor, text):
+    assert s.count(anchor) == 1, "anchor not unique/found: " + anchor
+    return s.replace(anchor, anchor + "\n" + text, 1)
+def ins_before(s, anchor, text):
+    assert s.count(anchor) == 1, "anchor not unique/found: " + anchor
+    return s.replace(anchor, text + "\n" + anchor, 1)
+
+D = '__android_log_print(ANDROID_LOG_ERROR, "RADV_XCLIPSE", '
+s = ins_after(s, "   bool supported_device = false;",
+  "   " + D + '"[940DIAG] enumerate: bustype=%d available_nodes=0x%x", (int)device->bustype, (unsigned)device->available_nodes);')
+s = ins_after(s, "\n   const char *path = drm_device->nodes[DRM_NODE_RENDER];",
+  "   " + D + '"[940DIAG] try_create: render node=%s", path ? path : "(null)");')
+s = ins_after(s, "   version = drmGetVersion(fd);",
+  "   " + D + '"[940DIAG] kernel drm driver name=\'%s\'", version ? version->name : "(null)");')
+s = ins_before(s, "   /* Allow all devices on a virtual winsys, otherwise do a basic support check. */",
+  "   " + D + '"[940DIAG] chip: family=%d gfx_level=%d pci_id=0x%x xclipse_model=%d", (int)pdev->info.family, (int)pdev->info.gfx_level, (unsigned)pdev->info.pci_id, (int)pdev->info.xclipse_model);')
+wr(p, s)
+
+# 4) show which SoC string the model detection sees
+p = "src/amd/common/ac_gpu_info.c"
+s = rd(p)
+anchor = "   if (device_id != 0x73a0)"
+s = ins_before(s, anchor,
+  "   " + D + '"[940DIAG] detect_model: device_id=0x%x chip_rev=0x%08x", (unsigned)device_id, (unsigned)chip_rev);')
+wr(p, s)
+print("patched OK")
+
+# ---- v2: first real fix for the Xclipse 940 -------------------------------------------------
+# The kernel reports family 147 (MGFX) with external_rev 0x02600200 on the 940, far outside the
+# 0x01..0xFF range the VANGOGH identification expects (530: 0x0A, 920: 0x80). That made
+# ac_identify_chip() fail with "unknown (family_id, chip_external_rev): (147, 39846400)".
+p = "src/amd/common/ac_gpu_info.c"
+s = rd(p)
+
+a = "(0x01..0xFF) matches both. */\n         identify_chip(VANGOGH);"
+assert s.count(a) == 1, "MGFX identify anchor"
+s = s.replace(a, a + "\n" +
+    "         if (info->family == CHIP_UNKNOWN) {\n"
+    "            " + D + '"[940FIX] MGFX external_rev 0x%x outside VANGOGH range -> forcing CHIP_VANGOGH", (unsigned)device_info->external_rev);\n'
+    "            info->family = CHIP_VANGOGH;\n"
+    "         }", 1)
+
+a = "   info->chip_external_rev = device_info->external_rev;"
+assert s.count(a) == 1, "chip_external_rev anchor"
+s = s.replace(a,
+    "   info->chip_external_rev = device_info->external_rev;\n"
+    "   if (device_info->family == FAMILY_MGFX && info->chip_external_rev > 0xFF) {\n"
+    "      " + D + '"[940FIX] chip_external_rev 0x%x -> 0x0A for addrlib", (unsigned)info->chip_external_rev);\n'
+    "      info->chip_external_rev = 0x0A;\n"
+    "   }", 1)
+
+a = "   /* Gfx6-8 don't set ip_discovery_version. */"
+assert s.count(a) == 1, "ip version anchor"
+s = s.replace(a,
+    "   " + D + '"[940DIAG] ip_type=%d kernel hw_ip_version=%u.%u ip_discovery=0x%x rings=0x%x family=%u ext_rev=0x%x", (int)ip_type, (unsigned)ip_info->hw_ip_version_major, (unsigned)ip_info->hw_ip_version_minor, (unsigned)ip_info->ip_discovery_version, (unsigned)ip_info->available_rings, (unsigned)device_info->family, (unsigned)device_info->external_rev);\n'
+    + a, 1)
+wr(p, s)
+print("v2 fix patched")
+
+# ---- v3: treat the 940 like the 530 for context init --------------------------------------------
+# Log of the v2 build: the 940 runs, enumerates and draws without errors, but the screen stays black.
+# The kernel reports the same family (147 / MGFX) as the 530, and for MGFX sgpu skips the RLC
+# clear-state buffer, so CLEAR_STATE is a no-op and the context registers stay unwritten. The 530
+# gets the vendor context-init table by default; the unknown model (the 940) did not (ctx_init=0).
+p = "src/amd/vulkan/radv_queue.c"
+s = rd(p)
+a = "cached = want >= 0 ? want : (pdev->info.xclipse_model == AC_XCLIPSE_530 ? 1 : 0);"
+assert s.count(a) == 1, "ctxinit default anchor"
+s = s.replace(a,
+    "cached = want >= 0 ? want : ((pdev->info.xclipse_model == AC_XCLIPSE_530 ||\n"
+    "                                    pdev->info.xclipse_model == AC_XCLIPSE_UNKNOWN) ? 1 : 0);", 1)
+wr(p, s)
+print("v3 ctxinit default patched")
+
+# ---- v4: 940 mode selector (one build, three experiments, chosen with an environment variable) --
+# Set RADV_XCLIPSE_940_MODE in the Winlator container environment variables:
+#   2 (default, also when unset) = GFX11: the 940 is RDNA 3, so use the GFX11 command/register level
+#   1 = 530-like: treat the 940 as the Xclipse 530 (same MGFX family): TITAN register remap + ctx init
+#   0 = previous behaviour (GFX10_3 registers, unknown model)
+p = "src/amd/common/ac_gpu_info.c"
+s = rd(p)
+
+a = "static enum ac_xclipse_model\nac_model_from_chip_rev(uint32_t chip_rev)"
+assert s.count(a) == 1, "model_from_chip_rev anchor"
+s = s.replace(a, "static int ac_940_mode = 0; /* set by ac_detect_xclipse_model() for the 940 */\n\n" + a, 1)
+
+a = "   return model;\n}\n\n#define AMDGPU_MI100_RANGE"
+assert s.count(a) == 1, "detect return anchor"
+new = (
+    "   if (model == AC_XCLIPSE_UNKNOWN && AC_MGFX_GEN(chip_rev) == 2 && AC_MGFX_MOD(chip_rev) == 0x60) {\n"
+    "      const char *msrc = \"default\";\n"
+    "      int mode = xclipse_knob_int(\"RADV_XCLIPSE_940_MODE\", \"debug.radv_xclipse_940_mode\", &msrc);\n"
+    "      if (mode < 0 || mode > 2)\n"
+    "         mode = 2;\n"
+    "      ac_940_mode = mode;\n"
+    "      " + D + '"[940MODE] mode=%d (%s) 0=GFX10_3 1=like-530 2=GFX11", mode, msrc);\n'
+    "      if (mode == 1)\n"
+    "         model = AC_XCLIPSE_530;\n"
+    "   }\n"
+    "   return model;\n}\n\n#define AMDGPU_MI100_RANGE")
+s = s.replace(a, new, 1)
+
+a = "   /* CHIP_TITAN: the 530 as its own family (RADV_XCLIPSE_TITAN)."
+assert s.count(a) == 1, "titan block anchor"
+new = (
+    "   if (ac_940_mode == 2 && info->xclipse_model == AC_XCLIPSE_UNKNOWN) {\n"
+    "      " + D + '"[940MODE] gfx_level %d -> GFX11 (%d)", (int)info->gfx_level, (int)GFX11);\n'
+    "      info->gfx_level = GFX11;\n"
+    "   }\n\n" + a)
+s = s.replace(a, new, 1)
+wr(p, s)
+print("v4 mode selector patched")
+
+# ---- v5: also write every driver log line to a small text file --------------------------------------
+# Easier than a full bug report: /sdcard/Download/radv940.log (fallback: the app's own external
+# files dir). Lines are also still sent to logcat. The file is truncated when it passes 2 MB.
+p = "src/amd/common/radv_log_helper.c"
+s = rd(p)
+
+a = "#include <stdlib.h>\n"
+assert s.count(a) == 1, "helper include anchor"
+s = s.replace(a, a + "#include <fcntl.h>\n#include <unistd.h>\n#include <string.h>\n#include <time.h>\n#include <sys/stat.h>\n", 1)
+
+a = "/* The verbose bring-up trace"
+assert s.count(a) == 1, "helper trace anchor"
+helper = r"""/* DIAG BUILD: mirror the driver log into a plain text file the user can attach. */
+static int radv940_log_fd = -2;
+
+static int
+radv940_open_log(void)
+{
+   if (radv940_log_fd != -2)
+      return radv940_log_fd;
+   int fd = open("/sdcard/Download/radv940.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
+   if (fd < 0) {
+      char cmd[160] = {0};
+      int cf = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
+      if (cf >= 0) {
+         ssize_t n = read(cf, cmd, sizeof(cmd) - 1);
+         close(cf);
+         if (n <= 0)
+            cmd[0] = 0;
+      }
+      char path[320];
+      /* The app's own external dir needs no storage permission. cmdline is the package name
+       * for the app process; other processes (wine, box64) simply fail to open it. */
+      snprintf(path, sizeof(path), "/sdcard/Android/data/%s/files/radv940.log", cmd);
+      fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
+   }
+   if (fd >= 0) {
+      struct stat st;
+      if (fstat(fd, &st) == 0 && st.st_size > 2 * 1024 * 1024)
+         ftruncate(fd, 0);
+   }
+   radv940_log_fd = fd;
+   return fd;
+}
+
+__attribute__((used, visibility("default")))
+void radv_log_file(const char *line)
+{
+   int fd = radv940_open_log();
+   if (fd < 0)
+      return;
+   struct timespec ts;
+   struct tm tmv;
+   clock_gettime(CLOCK_REALTIME, &ts);
+   localtime_r(&ts.tv_sec, &tmv);
+   char out[640];
+   int n = snprintf(out, sizeof(out), "%02d:%02d:%02d.%03d pid=%d %s\n", tmv.tm_hour, tmv.tm_min,
+                    tmv.tm_sec, (int)(ts.tv_nsec / 1000000), (int)getpid(), line);
+   if (n > 0)
+      write(fd, out, (size_t)(n < (int)sizeof(out) ? n : (int)sizeof(out) - 1));
+}
+
+__attribute__((used, visibility("default")))
+void radv940_log(const char *fmt, ...)
+{
+   char buf[512];
+   va_list ap;
+   va_start(ap, fmt);
+   vsnprintf(buf, sizeof(buf), fmt, ap);
+   va_end(ap);
+   __android_log_print(ANDROID_LOG_ERROR, "RADV_XCLIPSE", "%s", buf);
+   radv_log_file(buf);
+}
+
+"""
+s = s.replace(a, helper + a, 1)
+
+a = '   __android_log_print(ANDROID_LOG_INFO, "RADV_XCLIPSE", "%s", buf);\n}'
+assert s.count(a) == 1, "helper logmsg anchor"
+s = s.replace(a, '   __android_log_print(ANDROID_LOG_INFO, "RADV_XCLIPSE", "%s", buf);\n   radv_log_file(buf);\n}', 1)
+wr(p, s)
+
+# route the diagnostic prints in the two other files through radv940_log()
+OLD = '__android_log_print(ANDROID_LOG_ERROR, "RADV_XCLIPSE", '
+for p in ["src/amd/common/ac_gpu_info.c", "src/amd/vulkan/radv_physical_device.c"]:
+    s = rd(p)
+    n = s.count(OLD)
+    s = s.replace(OLD, "radv940_log(")
+    s = "void radv940_log(const char *fmt, ...);\n" + s
+    wr(p, s)
+    print(p, "-> radv940_log:", n)
+print("v5 file logging patched")
+
